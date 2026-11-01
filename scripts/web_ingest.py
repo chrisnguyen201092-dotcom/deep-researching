@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Multi-Tier Web & GitHub Deep Ingestion Tool (`web_ingest.py` v2.0)
+Multi-Tier Web & GitHub Deep Ingestion Tool (`web_ingest.py` v3.2)
 - GitHub Repo & Subpath Handler:
   - Repo roots: Fetches repo metadata + raw README + lists `docs/` markdown files via GitHub API.
   - Subpaths (`/blob/<branch>/<path>`): Automatically converts to `raw.githubusercontent.com` for clean raw ingestion.
-- Tier 1 Web Fetch: Direct HTTP + lxml structured Markdown extraction (preserves code blocks, headings, tables).
-- Tier 2 Web Fetch: Enhanced `r.jina.ai` Markdown Reader fallback (`X-Return-Format: markdown`) for SPA / Cloudflare pages.
-- Multi-threaded parallel URL ingestion (`ThreadPoolExecutor`) with thread-safe manifest locking.
+- GitHub Issues/PRs, X/Twitter Statuses & Longform Articles (`api.fxtwitter.com`), Reddit `.json` Threads, and HN Algolia Items.
+- Tier 1 Web Fetch: Direct HTTP + lxml structured Markdown extraction (preserves code blocks, headings, tables, and relative sidebar links).
+- Tier 2 Web Fetch: Enhanced `r.jina.ai` Markdown Reader fallback (`X-Return-Format: markdown`) with relative link resolution.
+- Automatic Sibling Documentation Tree Crawler: When ingesting an official documentation or guide page (`docs.*`, `/docs/`, `/guides/`, `/grok-bot/`, `/openbot*`), automatically discovers and ingests sibling subpages (e.g., `/security`, `/faq`, `/skills-routines-and-automations`, `/use-cases`, `/get-started`).
 """
 
 import argparse
@@ -356,12 +357,54 @@ def fetch_web_tier2_jina(url: str) -> Tuple[Optional[str], Optional[str], List[s
         }
         resp = requests.get(jina_url, headers=headers, timeout=30)
         if resp.status_code == 200 and len(resp.text.split()) >= 50:
-            links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", resp.text)))
+            abs_links = re.findall(r"https?://[^\s<>\"\'\)\]]+", resp.text)
+            rel_links = [urljoin(url, p) for p in re.findall(r"\]\((/[A-Za-z0-9_./-]+)\)", resp.text)]
+            links = sorted(set(abs_links + rel_links))
             first_line = resp.text.splitlines()[0].replace("Title:", "").strip() if resp.text else url
             return first_line or url, resp.text, links, "tier2_jina_reader"
     except Exception as e:
         return None, None, [], f"tier2_error: {type(e).__name__}: {e}"
     return None, None, [], "tier2_unavailable"
+
+
+def _discover_sibling_doc_urls(base_url: str, outbound_links: List[str], max_siblings: int = 6) -> List[str]:
+    """
+    When ingesting a documentation or product guide URL (e.g., https://docs.x.ai/grok-bot/overview
+    or https://x.ai/bot/guides/...), automatically discover sibling documentation pages under the same
+    section prefix (e.g., /security, /faq, /skills-routines-and-automations, /use-cases, /get-started).
+    """
+    parsed = urlparse(base_url)
+    host = parsed.netloc.lower()
+    path_parts = [p for p in parsed.path.split("/") if p]
+    is_doc_like = (
+        host.startswith("docs.")
+        or any(seg in ("docs", "guides", "manual", "handbook", "grok-bot", "openbot") for seg in path_parts)
+    )
+    if not is_doc_like or not path_parts:
+        return []
+
+    parent_prefix = "/" + "/".join(path_parts[:-1]) + "/" if len(path_parts) >= 2 else "/" + path_parts[0] + "/"
+    seen = {base_url.rstrip("/")}
+
+    priority_re = re.compile(
+        r"security|faq|pricing|plan|limit|quota|skill|routine|automation|use-case|get-started|computer|enterprise|guide|provider",
+        re.I,
+    )
+
+    candidates: List[str] = []
+    for lnk in outbound_links:
+        clean = lnk.split("#")[0].split("?")[0].rstrip("/")
+        if not clean or clean in seen:
+            continue
+        lp = urlparse(clean)
+        if lp.netloc.lower() != host:
+            continue
+        if lp.path.startswith(parent_prefix) and lp.path.rstrip("/") != parent_prefix.rstrip("/"):
+            seen.add(clean)
+            candidates.append(clean)
+
+    candidates.sort(key=lambda u: (0 if priority_re.search(u) else 1, len(u)))
+    return candidates[:max_siblings]
 
 
 def update_manifest_and_audit(
@@ -397,7 +440,7 @@ def update_manifest_and_audit(
             f.write(row)
 
 
-def process_url(url: str, ws: Path) -> Dict[str, Any]:
+def process_url(url: str, ws: Path, crawl_siblings: bool = True, max_siblings: int = 5) -> Dict[str, Any]:
     src_id = make_source_id(url)
     raw_dir = ws / "01_raw_sources"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -459,6 +502,21 @@ def process_url(url: str, ws: Path) -> Dict[str, Any]:
 
     out_md_path.write_text("\n".join(md_lines), encoding="utf-8")
 
+    # Auto-crawl sibling documentation subpages when ingesting an official doc/guide page
+    crawled_sibling_ids: List[str] = []
+    if crawl_siblings and special_res is None and evidence_level == "FULL_CONTENT_VERIFIED":
+        sibling_urls = _discover_sibling_doc_urls(url, links, max_siblings=max_siblings)
+        for sib_u in sibling_urls:
+            sib_id = make_source_id(sib_u)
+            if (raw_dir / f"{sib_id}.md").exists():
+                continue
+            try:
+                sib_res = process_url(sib_u, ws, crawl_siblings=False)
+                if sib_res.get("evidence_level") == "FULL_CONTENT_VERIFIED":
+                    crawled_sibling_ids.append(sib_res["id"])
+            except Exception:
+                pass
+
     source_entry = {
         "id": src_id,
         "kind": "web",
@@ -468,6 +526,7 @@ def process_url(url: str, ws: Path) -> Dict[str, Any]:
         "retrieval_method": method_note,
         "word_count": word_count,
         "snowball_links": links[:25],
+        "auto_crawled_sibling_docs": crawled_sibling_ids,
         "raw_path": rel_md_path,
         "extracted_note_path": f"02_extracted_notes/{src_id}_note.md",
     }
@@ -480,16 +539,17 @@ def process_url(url: str, ws: Path) -> Dict[str, Any]:
         tier_label=tier_label,
         rel_md_path=rel_md_path,
         status=status_label,
-        note=f"{title or url} ({word_count} words via {method_note})",
+        note=f"{title or url} ({word_count} words via {method_note}, +{len(crawled_sibling_ids)} sibling docs)",
     )
     return source_entry
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Deep Web & GitHub Source Ingestion v2.0")
+    parser = argparse.ArgumentParser(description="Deep Web & GitHub Source Ingestion v3.2")
     parser.add_argument("urls", nargs="+", help="URLs to fetch and extract")
     parser.add_argument("--out", required=True, help="Target research workspace directory")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent URL ingestion workers")
+    parser.add_argument("--no-sibling-crawl", action="store_true", help="Disable automatic sibling documentation crawling")
     args = parser.parse_args()
 
     ws = Path(args.out).resolve()
@@ -497,7 +557,9 @@ def main() -> None:
     workers = max(1, min(args.workers, len(args.urls)))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_url = {pool.submit(process_url, u, ws): u for u in args.urls}
+        future_to_url = {
+            pool.submit(process_url, u, ws, not args.no_sibling_crawl): u for u in args.urls
+        }
         for fut in concurrent.futures.as_completed(future_to_url):
             u = future_to_url[fut]
             try:

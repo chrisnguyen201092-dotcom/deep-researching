@@ -41,6 +41,12 @@ Tag each major claim with one of the 5 Epistemic Tiers:
 ## 7. Failure Modes, Pitfalls & Limits Surfaced
 - Where did the tool/workflow break, hit rate/billing limits, hallucinate, or require human intervention?
 
-## 8. Snowball Leads (High-Value Referenced Sources)
-- Which specific repos, papers, tools, or creator workflows mentioned in this source should be fetched next?
+## 8. Hard Technical Quotas, Numerical Specs, Pricing & Version Dates
+- Extract EVERY concrete number mentioned: max routines/agents, minimum intervals (e.g. `5 min`), file/video size caps (e.g. `25 MB` / `250 MB`), approval timeout minutes (`10 min` / `30 min`), context compaction thresholds (`30-50 messages`), subscription tier prices (`$30` / `$100` / `$200`), and exact changelog/release dates.
+
+## 9. Cross-Source Contradictions & Discrepancies
+- Note any claim in this source that conflicts with official docs or other sources (e.g., creator says "1 VM per bot" whereas official security docs state "1 shared VM per account with separate virtual displays"; or outdated pricing from an older build).
+
+## 10. Snowball Leads (High-Value Referenced Sources)
+- Which specific official doc subpages (`/security`, `/faq`, `/use-cases`), repos, papers, or creator workflows mentioned in this source should be fetched next?
 ```

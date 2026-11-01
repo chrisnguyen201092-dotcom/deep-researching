@@ -9,6 +9,7 @@
 ### Forbidden Slop Patterns (Enforced by `audit_report.py`)
 - Never write `"cấu hình cho phù hợp"`, `"tùy theo nhu cầu của bạn"`, `"bạn có thể tự tìm hiểu thêm"`, or `"xem chi tiết tại video"`.
 - Never use placeholders (`[TODO]`, `TBD`, `FIXME`).
+- **Zero Word-Counting & No Meta-Commentary Padding:** Never count words (`wc`) or append filler sentences about the research process itself (e.g., *"The report will be refreshed as new sources are added to the corpus"*, *"as more transcripts become available"*). `audit_report.py` grades structural artifact density (tables, `## ` sections, `mermaid` diagrams, and fenced code/prompt blocks), never word count.
 - When a fact is unknown (`[Unknown]`), state explicitly what you searched: *"Searched official docs, GitHub issues, and 8 tutorial transcripts for keyword X; no evidence found."*
 
 ---

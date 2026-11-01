@@ -99,16 +99,17 @@ Do NOT rely on search snippets or YouTube titles/descriptions. Ingest full conte
    - Make `00_MASTER_REPORT.md` a **self-contained, critically deep Definitive Guide** following the **5 Laws in [diataxis_playbook_guide.md](resources/diataxis_playbook_guide.md)**:
      1. **Executive Disambiguation & 1-to-1 Feature Translation Matrix** (mapping commercial/cloud features to local/free equivalents).
      2. **Critical ROI Tiering of Use Cases:** Classify workflows into **Tier 1 (Core Daily Must-Build)**, **Tier 2 (Specialist Weapons + Free/Indie Stack Replacements for Enterprise Tools)**, and **Tier 3 (Stage Demos / Low-ROI Critique)**.
-     3. **The Canonical Blueprint ("Golden Setup"):** Synthesize fragmented creator setups into 1 unified architecture with **inline copy-pasteable System Prompts/Configs** (`>= 3` fenced blocks) and a **First 30 Minutes $\rightarrow$ Day 3 $\rightarrow$ Week 2 Roadmap**.
+     3. **The Canonical Blueprint ("Golden Setup"):** Synthesize fragmented creator setups into 1 unified architecture with **inline copy-pasteable System Prompts/Configs** (`>= 3` fenced blocks) and a **First 30 Minutes → Day 3 → Week 2 Roadmap**.
      4. **Clean Editorial Readability & Inline Visuals:** Use compact `[#1, 14:20]` citations in prose (keeping `_note.md` links in the bottom Evidence Table), include GitHub alert callouts (`> [!TIP]`, `> [!WARNING]`), and embed extracted keyframe screenshots (`![caption](file:///.../keyframes/...)`) inline.
    - Apply **Unslop Rule 27 (Project-Swap Test)**: Cut any generic sentence that would still sound true if you swapped the subject's name with another tool.
+   - **Anti-Padding Rule (Zero Word-Counting):** NEVER count words (`wc`), calculate word deficits (`+61 words`, `+15 words`), or append meta-commentary filler sentences (e.g., *"The report will be refreshed as new sources are added to the corpus"*) to make a file longer. Quality is measured strictly by **structural artifact density** (concrete `## ` sections, comparison tables, Mermaid diagrams, and verbatim code/prompt blocks), never by prose word count.
 
 ### Phase 6: Deterministic Quality Gate (`audit_report.py`)
 Before presenting the final response to the user, run the automated auditor:
 ```bash
 node "<skill_dir>/scripts/research_cli.mjs" audit "./research-<slug>" --min-sources 3 --min-playbooks 2
 ```
-- If `"passed": false`, inspect the `errors` and `slop_violations` arrays in the JSON output, fix every missing extraction note, short playbook, or forbidden vague phrase, and re-run `audit` until `"passed": true`.
+- If `"passed": false`, inspect the `errors` and `slop_violations` arrays in the JSON output and fix the missing structural artifacts (missing `## ` sections, missing fenced code/prompt blocks, missing tables, or flagged slop phrases) in a **single targeted edit**, then re-run `audit` once until `"passed": true`. Never loop to pad word counts.
 
 ---
 

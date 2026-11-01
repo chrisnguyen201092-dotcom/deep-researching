@@ -33,6 +33,18 @@ FORBIDDEN_SLOP_PATTERNS = [
     (r"\bneedless to say\b|\bin conclusion, it is clear\b", "AI throat-clearing filler phrase."),
     (r"\bdelve into\b|\btestament to\b|\btapestry of\b", "Unslop Rule 7 AI vocabulary ('delve/testament/tapestry')."),
     (r"\[TODO\]|\bTBD\b|\bFIXME\b", "Unfinished placeholder ([TODO] / TBD / FIXME)."),
+    (
+        r"\bwill be (?:refreshed|revisited|updated) as (?:new|more|additional) sources\b",
+        "Word-padding meta-commentary ('will be refreshed/updated as new sources...') — delete filler sentence.",
+    ),
+    (
+        r"\bas (?:more|additional)?\s*transcripts become available\b",
+        "Word-padding meta-commentary ('as transcripts become available') — delete filler sentence.",
+    ),
+    (
+        r"\bas new sources are (?:ingested|added to the corpus)\b",
+        "Word-padding meta-commentary ('as new sources are added to the corpus') — delete filler sentence.",
+    ),
 ]
 
 
@@ -63,14 +75,12 @@ def scan_file_for_slop(md_path: Path) -> List[Dict[str, Any]]:
 
 def compute_required_note_words(raw_word_count: int) -> int:
     """
-    Proportional scaling:
-    - Small source (<1,000 raw words) -> min 140 words in extraction note
-    - Medium source (3,000 raw words) -> min 240 words in extraction note
-    - Long workshop/repo (8,000+ raw words) -> min 350 words in extraction note
+    Low anti-stub floor (never exposes exact word-count targets in error messages so agents
+    do not waste tool calls counting words or padding prose).
     """
     if raw_word_count <= 800:
-        return 130
-    return min(350, max(150, int(raw_word_count * 0.045)))
+        return 90
+    return 140
 
 
 def compute_saturation_metrics(verified_sources: List[Dict[str, Any]], ws: Path) -> Dict[str, Any]:
@@ -187,7 +197,9 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
             txt = note_path.read_text(encoding="utf-8", errors="replace")
             wc = len(txt.split())
             if wc < req_wc:
-                shallow_notes.append(f"{note_rel} ({wc} words < {req_wc} proportional min for {raw_wc}-word source)")
+                shallow_notes.append(
+                    f"{note_rel} is a stub — extract concrete commands, prompts, or failure modes from the raw source (NEVER pad prose or count words)"
+                )
 
             h2_count = len(re.findall(r"^##\s+", txt, flags=re.MULTILINE))
             if h2_count < 6:
@@ -205,14 +217,14 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
         )
     if shallow_notes:
         errors.append(
-            "Proportional depth violation in 02_extracted_notes/: " + "; ".join(shallow_notes[:5])
+            "Incomplete extraction note(s) in 02_extracted_notes/: " + "; ".join(shallow_notes[:5])
         )
     if incomplete_schema_notes:
         errors.append(
             "Extraction schema violation in 02_extracted_notes/: " + "; ".join(incomplete_schema_notes[:5])
         )
 
-    # Check Playbooks
+    # Check Playbooks (Artifact Density over Word Count)
     playbook_files = sorted(playbooks_dir.glob("*.md")) if playbooks_dir.exists() else []
     if len(playbook_files) < min_playbooks:
         errors.append(
@@ -222,18 +234,18 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
     for pb in playbook_files:
         pb_txt = pb.read_text(encoding="utf-8", errors="replace")
         pb_wc = len(pb_txt.split())
-        if pb_wc < 350:
-            errors.append(f"Playbook '{pb.name}' is too brief ({pb_wc} words < 350 min).")
+        pb_h2 = len(re.findall(r"^##\s+", pb_txt, flags=re.MULTILINE))
+        if pb_wc < 180 or pb_h2 < 5:
+            errors.append(
+                f"Playbook '{pb.name}' is missing required Diátaxis sections (found {pb_h2}/5 '##' sections). Add concrete setup steps, code/prompt blocks, or failure-mode tables — do NOT pad prose."
+            )
         if "```" not in pb_txt:
             errors.append(
                 f"Playbook '{pb.name}' lacks concrete code/prompt/config blocks (no fenced ``` block found)."
             )
-        pb_h2 = len(re.findall(r"^##\s+", pb_txt, flags=re.MULTILINE))
-        if pb_h2 < 5:
-            errors.append(f"Playbook '{pb.name}' has only {pb_h2} '##' sections (expected >= 5 Diátaxis sections).")
         slop_hits.extend(scan_file_for_slop(pb))
 
-    # Check Master Report
+    # Check Master Report (Structural & Artifact Density over Word Count)
     master_wc = 0
     keyframes_dir = ws / "01_raw_sources" / "keyframes"
     available_keyframes = list(keyframes_dir.glob("*.jpg")) + list(keyframes_dir.glob("*.png")) if keyframes_dir.exists() else []
@@ -243,8 +255,12 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
     else:
         m_txt = master_report.read_text(encoding="utf-8", errors="replace")
         master_wc = len(m_txt.split())
-        if master_wc < 1500:
-            errors.append(f"00_MASTER_REPORT.md is too short ({master_wc} words < 1500 min for a self-contained Master Guide).")
+        master_h2 = len(re.findall(r"^##\s+", m_txt, flags=re.MULTILINE))
+        table_sep_count = len(re.findall(r"^\s*\|?\s*:?-{3,}:?\s*\|", m_txt, flags=re.MULTILINE))
+        if master_wc < 600 or master_h2 < 5 or table_sep_count < 2:
+            errors.append(
+                f"00_MASTER_REPORT.md lacks structural density (found {master_h2} '##' sections, {table_sep_count} Markdown tables; expected >= 5 '##' sections and >= 2 comparison/audit tables). Add concrete technical tables or extracted prompts from 02_extracted_notes/ — NEVER count words or pad filler sentences."
+            )
         if "```mermaid" not in m_txt or "|" not in m_txt:
             errors.append("00_MASTER_REPORT.md must include both a Mermaid architecture diagram (```mermaid) and comparison tables (|).")
 

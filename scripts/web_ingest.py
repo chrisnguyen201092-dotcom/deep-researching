@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+Multi-Tier Web & GitHub Deep Ingestion Tool (`web_ingest.py` v2.0)
+- GitHub Repo & Subpath Handler:
+  - Repo roots: Fetches repo metadata + raw README + lists `docs/` markdown files via GitHub API.
+  - Subpaths (`/blob/<branch>/<path>`): Automatically converts to `raw.githubusercontent.com` for clean raw ingestion.
+- Tier 1 Web Fetch: Direct HTTP + lxml structured Markdown extraction (preserves code blocks, headings, tables).
+- Tier 2 Web Fetch: Enhanced `r.jina.ai` Markdown Reader fallback (`X-Return-Format: markdown`) for SPA / Cloudflare pages.
+- Multi-threaded parallel URL ingestion (`ThreadPoolExecutor`) with thread-safe manifest locking.
+"""
+
+import argparse
+import concurrent.futures
+import datetime
+import hashlib
+import json
+import re
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
+
+import lxml.html
+import requests
+
+MANIFEST_LOCK = threading.Lock()
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def make_source_id(url: str) -> str:
+    parsed = urlparse(url)
+    host = re.sub(r"[^a-zA-Z0-9]+", "_", (parsed.netloc or "web").replace("www.", "")).strip("_").lower()
+    path_slug = re.sub(r"[^a-zA-Z0-9]+", "_", parsed.path.strip("/")).strip("_").lower()
+    if not path_slug:
+        path_slug = "index"
+    short_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:6]
+    slug = f"{host}_{path_slug}"[:42].strip("_")
+    return f"web_{slug}_{short_hash}"
+
+
+def fetch_github_url(url: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Handle both GitHub repository root URLs and direct `/blob/` file URLs."""
+    u = url.strip()
+
+    # Case 1: Direct GitHub `/blob/{branch}/{path}` file URL
+    blob_m = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/blob/([^/]+)/(.+)$", u)
+    if blob_m:
+        owner, repo, branch, file_path = blob_m.groups()
+        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+        try:
+            r = requests.get(raw_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+            if r.status_code == 200 and len(r.text.strip()) > 40:
+                links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", r.text)))
+                title = f"GitHub File: {owner}/{repo}/{file_path}"
+                return title, r.text, links, f"github_raw_blob_{branch}"
+        except Exception:
+            pass
+
+    # Case 2: Repository root URL
+    m = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git|/)?$", u)
+    if not m:
+        return None
+
+    owner, repo = m.group(1), m.group(2)
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github.v3+json"}
+    meta_lines: List[str] = []
+    docs_links: List[str] = []
+    title = f"GitHub: {owner}/{repo}"
+    default_branch = "main"
+
+    try:
+        api_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}", headers=headers, timeout=15)
+        if api_resp.status_code == 200:
+            data = api_resp.json()
+            default_branch = data.get("default_branch") or "main"
+            desc = data.get("description") or ""
+            stars = data.get("stargazers_count", 0)
+            license_info = (data.get("license") or {}).get("spdx_id") or "Unknown"
+            topics = ", ".join(data.get("topics") or [])
+            meta_lines = [
+                f"- **Repository:** `{owner}/{repo}`",
+                f"- **Description:** {desc}",
+                f"- **Stars:** {stars:,}",
+                f"- **License:** {license_info}",
+                f"- **Default Branch:** `{default_branch}`",
+                f"- **Topics:** {topics}",
+                "",
+            ]
+        # Also discover top-level docs/ directory files if present for snowballing
+        docs_resp = requests.get(f"https://api.github.com/repos/{owner}/{repo}/contents/docs", headers=headers, timeout=10)
+        if docs_resp.status_code == 200 and isinstance(docs_resp.json(), list):
+            for item in docs_resp.json():
+                if isinstance(item, dict) and item.get("html_url"):
+                    docs_links.append(item["html_url"])
+    except Exception:
+        pass
+
+    for branch in (default_branch, "main", "master"):
+        for fname in ("README.md", "readme.md", "README.rst"):
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{fname}"
+            try:
+                r = requests.get(raw_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+                if r.status_code == 200 and len(r.text.strip()) > 100:
+                    links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", r.text) + docs_links))
+                    docs_section = ""
+                    if docs_links:
+                        docs_section = "\n## Discovered Repository `/docs` Files\n" + "\n".join(f"- {d}" for d in docs_links) + "\n"
+                    body = "\n".join(meta_lines) + docs_section + "\n## Repository README\n\n" + r.text
+                    return title, body, links, f"github_raw_{branch}_{fname}"
+            except Exception:
+                pass
+    return None
+
+
+def fetch_github_issue_url(url: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Fetch GitHub Issue or PR body + top 30 comments via GitHub API."""
+    m = re.match(r"^https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(?:issues|pull)/(\d+)", url.strip())
+    if not m:
+        return None
+    owner, repo, issue_num = m.groups()
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.get(f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_num}", headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        issue = r.json()
+        title = f"GitHub Issue #{issue_num} ({owner}/{repo}): {issue.get('title', '')}"
+        lines = [
+            f"- **Repository:** `{owner}/{repo}`",
+            f"- **Author:** `{(issue.get('user') or {}).get('login', 'unknown')}`",
+            f"- **State:** `{issue.get('state', 'open')}` | **Comments:** `{issue.get('comments', 0)}`",
+            "",
+            "## Original Issue Description",
+            issue.get("body") or "(No body)",
+            "",
+            "## Practitioner Comments & Workarounds",
+        ]
+        c_resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_num}/comments?per_page=30",
+            headers=headers,
+            timeout=15,
+        )
+        if c_resp.status_code == 200 and isinstance(c_resp.json(), list):
+            for idx, c in enumerate(c_resp.json(), start=1):
+                user = (c.get("user") or {}).get("login", "user")
+                body = c.get("body") or ""
+                lines.append(f"\n### Comment #{idx} by @{user}\n{body}\n")
+        full_text = "\n".join(lines)
+        links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", full_text)))
+        return title, full_text, links, "github_issue_api"
+    except Exception:
+        return None
+
+
+def fetch_x_twitter_url(url: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Bypass X/Twitter login walls using the public FxTwitter JSON API (supports Longform X Articles & Quoted Tweets)."""
+    m = re.match(r"^https?://(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)", url.strip())
+    if not m:
+        return None
+    user, status_id = m.groups()
+    api_url = f"https://api.fxtwitter.com/{user}/status/{status_id}"
+    try:
+        r = requests.get(api_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+        if r.status_code != 200:
+            return None
+        tweet = (r.json() or {}).get("tweet") or {}
+        if not tweet:
+            return None
+        author_name = (tweet.get("author") or {}).get("name") or user
+        text = tweet.get("text") or ""
+        article = tweet.get("article") or {}
+        article_title = article.get("title") or ""
+        article_blocks = (article.get("content") or {}).get("blocks") or []
+        article_text = "\n\n".join(str(b.get("text", "")).strip() for b in article_blocks if str(b.get("text", "")).strip())
+
+        lines = [
+            f"- **Author:** {author_name} (`@{user}`)",
+            f"- **Created At:** {tweet.get('created_at', '')}",
+            f"- **Likes:** {tweet.get('likes', 0)} | **Retweets:** {tweet.get('retweets', 0)} | **Views:** {tweet.get('views', 0)}",
+            "",
+            "## Main Post Content",
+            text,
+        ]
+        if article_title or article_text:
+            lines.extend(["", f"## Longform X Article: {article_title}", article_text])
+        quote = tweet.get("quote")
+        if isinstance(quote, dict) and quote.get("text"):
+            q_user = (quote.get("author") or {}).get("screen_name", "user")
+            lines.extend(["", f"## Quoted Post (@{q_user})", quote.get("text", "")])
+
+        full_text = "\n".join(lines)
+        links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", full_text)))
+        title = f"X Post by @{user}: {(article_title or text)[:80]}"
+        return title, full_text, links, "fxtwitter_json_bridge"
+    except Exception:
+        return None
+
+
+def fetch_reddit_url(url: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Fetch full Reddit post + top 25 practitioner comments via Reddit's `.json` endpoint."""
+    if "reddit.com/r/" not in url or "/comments/" not in url:
+        return None
+    clean_url = url.split("?")[0].rstrip("/") + ".json?limit=35"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DeepResearchSkill/3.0"}
+    try:
+        r = requests.get(clean_url, headers=headers, timeout=15)
+        if r.status_code != 200 or not isinstance(r.json(), list) or len(r.json()) < 2:
+            return None
+        data = r.json()
+        post_data = (((data[0].get("data") or {}).get("children") or [{}])[0]).get("data") or {}
+        sub = post_data.get("subreddit_name_prefixed") or "r/reddit"
+        title = f"[{sub}] {post_data.get('title', 'Reddit Discussion')}"
+        selftext = post_data.get("selftext") or "(Link post)"
+        lines = [
+            f"- **Subreddit:** `{sub}` | **Author:** `u/{post_data.get('author', 'user')}` | **Score:** `{post_data.get('score', 0)}`",
+            "",
+            "## Original Post",
+            selftext,
+            "",
+            "## Top Community Comments & Field Reports",
+        ]
+        comments = (data[1].get("data") or {}).get("children") or []
+        for idx, c in enumerate(comments[:25], start=1):
+            c_data = c.get("data") or {}
+            body = c_data.get("body")
+            if not body or body in ("[deleted]", "[removed]"):
+                continue
+            author = c_data.get("author", "user")
+            score = c_data.get("score", 0)
+            lines.append(f"\n### Comment #{idx} by u/{author} ({score} pts)\n{body}\n")
+        full_text = "\n".join(lines)
+        links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", full_text)))
+        return title, full_text, links, "reddit_json_api"
+    except Exception:
+        return None
+
+
+def fetch_hackernews_url(url: str) -> Optional[Tuple[str, str, List[str], str]]:
+    """Fetch Hacker News story + top 30 technical comments via HN Algolia Item API."""
+    m = re.search(r"news\.ycombinator\.com/item\?id=(\d+)", url)
+    if not m:
+        return None
+    item_id = m.group(1)
+    try:
+        r = requests.get(f"https://hn.algolia.com/api/v1/items/{item_id}", headers={"User-Agent": USER_AGENT}, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        title = f"Hacker News Discussion: {data.get('title') or f'Item #{item_id}'}"
+        lines = [
+            f"- **HN Item ID:** `{item_id}` | **Author:** `{data.get('author', 'hn')}` | **Points:** `{data.get('points', 0)}`",
+            f"- **Linked URL:** {data.get('url') or '(Ask/Show HN text post)'}",
+            "",
+        ]
+        if data.get("text"):
+            lines.extend(["## Post Text", lxml.html.fromstring(data["text"]).text_content(), ""])
+        lines.append("## Top Practitioner Comments")
+        children = data.get("children") or []
+        count = 0
+        for child in children:
+            txt_html = child.get("text")
+            if not txt_html:
+                continue
+            count += 1
+            clean_txt = lxml.html.fromstring(txt_html).text_content().strip()
+            author = child.get("author") or "user"
+            lines.append(f"\n### Comment #{count} by {author}\n{clean_txt}\n")
+            for sub in (child.get("children") or [])[:3]:
+                if sub.get("text"):
+                    sub_txt = lxml.html.fromstring(sub["text"]).text_content().strip()
+                    lines.append(f"  - **Reply by {sub.get('author', 'user')}:** {sub_txt}")
+            if count >= 25:
+                break
+        full_text = "\n".join(lines)
+        links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", full_text)))
+        return title, full_text, links, "hn_algolia_item_api"
+    except Exception:
+        return None
+
+
+def html_to_structured_markdown(html_text: str, base_url: str) -> Tuple[str, str, List[str]]:
+    doc = lxml.html.fromstring(html_text)
+    title_els = doc.xpath("//title/text()")
+    title = title_els[0].strip() if title_els else base_url
+
+    outbound: List[str] = []
+    for a in doc.xpath("//a[@href]"):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
+            continue
+        full_url = urljoin(base_url, href)
+        if full_url.startswith("http"):
+            outbound.append(full_url)
+
+    for bad in doc.xpath("//script | //style | //noscript | //svg | //nav | //footer | //iframe"):
+        bad.drop_tree()
+
+    main_nodes = doc.xpath("//main | //article | //*[@role='main']")
+    root = main_nodes[0] if main_nodes else doc.body if doc.body is not None else doc
+
+    lines: List[str] = []
+    for el in root.iter():
+        tag = el.tag if isinstance(el.tag, str) else ""
+        if tag in ("h1", "h2", "h3", "h4"):
+            level = int(tag[1])
+            txt = " ".join(el.itertext()).strip()
+            if txt:
+                lines.append(f"\n{'#' * level} {txt}\n")
+        elif tag == "pre":
+            code_txt = "".join(el.itertext()).strip()
+            if code_txt:
+                lines.append(f"\n```\n{code_txt}\n```\n")
+        elif tag == "li":
+            txt = " ".join(el.itertext()).strip()
+            if txt and len(txt) < 1000:
+                lines.append(f"- {txt}")
+        elif tag == "p":
+            txt = " ".join(el.itertext()).strip()
+            if txt:
+                lines.append(f"\n{txt}\n")
+
+    rendered = "\n".join(lines).strip()
+    if len(rendered.split()) < 80:
+        rendered = "\n".join(line.strip() for line in root.itertext() if line.strip())
+
+    return title, rendered, sorted(set(outbound))
+
+
+def fetch_web_tier1(url: str) -> Tuple[Optional[str], Optional[str], List[str], str]:
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
+        if resp.status_code == 200 and len(resp.text) > 200:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "markdown" in ctype or "text/plain" in ctype or url.endswith(".md"):
+                links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", resp.text)))
+                return url, resp.text, links, "tier1_raw_text"
+            title, md_body, links = html_to_structured_markdown(resp.text, url)
+            if len(md_body.split()) >= 120:
+                return title, md_body, links, "tier1_direct_lxml"
+    except Exception as e:
+        return None, None, [], f"tier1_error: {type(e).__name__}: {e}"
+    return None, None, [], "tier1_insufficient_content_falling_back_to_jina"
+
+
+def fetch_web_tier2_jina(url: str) -> Tuple[Optional[str], Optional[str], List[str], str]:
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/plain, text/markdown",
+            "X-Return-Format": "markdown",
+        }
+        resp = requests.get(jina_url, headers=headers, timeout=30)
+        if resp.status_code == 200 and len(resp.text.split()) >= 50:
+            links = sorted(set(re.findall(r"https?://[^\s<>\"\'\)\]]+", resp.text)))
+            first_line = resp.text.splitlines()[0].replace("Title:", "").strip() if resp.text else url
+            return first_line or url, resp.text, links, "tier2_jina_reader"
+    except Exception as e:
+        return None, None, [], f"tier2_error: {type(e).__name__}: {e}"
+    return None, None, [], "tier2_unavailable"
+
+
+def update_manifest_and_audit(
+    ws: Path,
+    source_entry: Dict[str, Any],
+    tier_label: str,
+    rel_md_path: str,
+    status: str,
+    note: str,
+) -> None:
+    with MANIFEST_LOCK:
+        manifest_path = ws / "01_raw_sources" / "sources_manifest.json"
+        manifest: Dict[str, Any] = {"topic": "Research", "createdAt": "", "sources": []}
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        sources = [s for s in manifest.get("sources", []) if s.get("id") != source_entry["id"]]
+        sources.append(source_entry)
+        manifest["sources"] = sources
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        audit_path = ws / "audit_trail.tsv"
+        if not audit_path.exists():
+            audit_path.write_text("ts\tphase\tsource_id\ttier\tevidence_path\tstatus\tnote\n", encoding="utf-8")
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        clean_note = note.replace("\t", " ").replace("\n", " ").strip()
+        row = f"{now}\tingest_web\t{source_entry['id']}\t{tier_label}\t{rel_md_path}\t{status}\t{clean_note}\n"
+        with audit_path.open("a", encoding="utf-8") as f:
+            f.write(row)
+
+
+def process_url(url: str, ws: Path) -> Dict[str, Any]:
+    src_id = make_source_id(url)
+    raw_dir = ws / "01_raw_sources"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    special_res = (
+        fetch_github_issue_url(url)
+        or fetch_github_url(url)
+        or fetch_x_twitter_url(url)
+        or fetch_reddit_url(url)
+        or fetch_hackernews_url(url)
+    )
+    if special_res is not None:
+        title, body, links, method_note = special_res
+    else:
+        title, body, links, method_note = fetch_web_tier1(url)
+        if not body:
+            title, body, links, method_note = fetch_web_tier2_jina(url)
+
+    word_count = len((body or "").split())
+    evidence_level = "FULL_CONTENT_VERIFIED" if body and word_count >= 35 else "INACCESSIBLE_OR_BLOCKED"
+
+    rel_md_path = f"01_raw_sources/{src_id}.md"
+    out_md_path = raw_dir / f"{src_id}.md"
+
+    md_lines = [
+        f"# [Web Source] {title or url}",
+        "",
+        "## 1. Provenance & Evidence Status",
+        f"- **Source ID:** `{src_id}`",
+        f"- **URL:** {url}",
+        f"- **Retrieved At:** {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"- **Evidence Level:** `{evidence_level}`",
+        f"- **Retrieval Method:** `{method_note}`",
+        f"- **Word Count:** {word_count}",
+        "",
+    ]
+
+    if links:
+        md_lines.append("## 2. Outbound Links (Snowballing Candidates)")
+        for lnk in links[:30]:
+            md_lines.append(f"- {lnk}")
+        md_lines.append("")
+
+    md_lines.append("## 3. Extracted Full Content")
+    if body and word_count >= 50:
+        words = body.split()
+        if len(words) > 4000:
+            chunk_size = 3500
+            for i in range(0, len(words), chunk_size):
+                part_num = (i // chunk_size) + 1
+                md_lines.append(f"\n### [Chunk {part_num} — Words {i+1} to {min(i+chunk_size, len(words))}]\n")
+                md_lines.append(" ".join(words[i : i + chunk_size]))
+        else:
+            md_lines.append(body)
+    else:
+        md_lines.append(
+            "> [!CAUTION]\n> **SOURCE INACCESSIBLE.** Automated extraction could not retrieve substantive content. Use browser fallback or mark as `Unknown` in epistemics."
+        )
+
+    out_md_path.write_text("\n".join(md_lines), encoding="utf-8")
+
+    source_entry = {
+        "id": src_id,
+        "kind": "web",
+        "url": url,
+        "title": title or url,
+        "evidence_level": evidence_level,
+        "retrieval_method": method_note,
+        "word_count": word_count,
+        "snowball_links": links[:25],
+        "raw_path": rel_md_path,
+        "extracted_note_path": f"02_extracted_notes/{src_id}_note.md",
+    }
+
+    tier_label = "Direct" if evidence_level == "FULL_CONTENT_VERIFIED" else "Unknown"
+    status_label = "VERIFIED_FULL" if evidence_level == "FULL_CONTENT_VERIFIED" else "INACCESSIBLE"
+    update_manifest_and_audit(
+        ws=ws,
+        source_entry=source_entry,
+        tier_label=tier_label,
+        rel_md_path=rel_md_path,
+        status=status_label,
+        note=f"{title or url} ({word_count} words via {method_note})",
+    )
+    return source_entry
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Deep Web & GitHub Source Ingestion v2.0")
+    parser.add_argument("urls", nargs="+", help="URLs to fetch and extract")
+    parser.add_argument("--out", required=True, help="Target research workspace directory")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent URL ingestion workers")
+    args = parser.parse_args()
+
+    ws = Path(args.out).resolve()
+    results: List[Dict[str, Any]] = []
+    workers = max(1, min(args.workers, len(args.urls)))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_url = {pool.submit(process_url, u, ws): u for u in args.urls}
+        for fut in concurrent.futures.as_completed(future_to_url):
+            u = future_to_url[fut]
+            try:
+                res = fut.result()
+                results.append({"ok": True, **res})
+            except Exception as e:
+                results.append({"ok": False, "url": u, "error": f"{type(e).__name__}: {e}"})
+
+    print(json.dumps({"processed": len(results), "results": results}, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

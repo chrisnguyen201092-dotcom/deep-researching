@@ -246,9 +246,29 @@ def fetch_transcript_tier1(video_id: str, lang_prefs: List[str]) -> Tuple[Option
                             transcript_obj = t
                             break
                     if transcript_obj is not None:
-                        fetched = transcript_obj.fetch()
-                        raw = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else list(fetched)
-                        return raw, f"tier1_ytt_v1 ({getattr(transcript_obj, 'language_code', 'auto')})"
+                        try:
+                            fetched = transcript_obj.fetch()
+                            raw = fetched.to_raw_data() if hasattr(fetched, "to_raw_data") else list(fetched)
+                            return raw, f"tier1_ytt_v1 ({getattr(transcript_obj, 'language_code', 'auto')})"
+                        except Exception as fetch_e:
+                            # Tier 1B: If YouTube rate-limits GET /api/timedtext (429 IpBlocked),
+                            # redeem the ip=0.0.0.0 signed Android timedtext URL via Jina edge relay in json3 format!
+                            t_url = getattr(transcript_obj, "_url", "")
+                            if t_url:
+                                json3_url = t_url if "fmt=json3" in t_url else f"{t_url}&fmt=json3"
+                                relay_resp = requests.get(
+                                    f"https://r.jina.ai/{json3_url}",
+                                    headers={"User-Agent": "Mozilla/5.0", "X-Return-Format": "text"},
+                                    timeout=25,
+                                )
+                                if relay_resp.status_code == 200 and '"events"' in relay_resp.text:
+                                    segs = parse_json3_captions(relay_resp.json())
+                                    if segs:
+                                        return (
+                                            segs,
+                                            f"tier1b_jina_edge_relay ({getattr(transcript_obj, 'language_code', 'auto')})",
+                                        )
+                            raise fetch_e
                 except Exception as inner_e:
                     err_name = type(inner_e).__name__
                     if "IpBlocked" in err_name or "429" in str(inner_e):
@@ -281,24 +301,44 @@ def parse_json3_captions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def fetch_transcript_tier2_ytdlp(info: Dict[str, Any], lang_prefs: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], str]:
-    """Tier 2: Extract captions from yt-dlp info dict (subtitles or automatic_captions)."""
+    """Tier 2: Extract captions from yt-dlp info dict (subtitles or automatic_captions), with Jina edge relay fallback on 429."""
+    expanded_prefs: List[str] = []
+    for lp in lang_prefs:
+        expanded_prefs.extend([f"{lp}-orig", lp])
+
     for source_key in ("subtitles", "automatic_captions"):
         tracks_by_lang = info.get(source_key) or {}
         if not tracks_by_lang:
             continue
-        candidate_langs = [l for l in lang_prefs if l in tracks_by_lang]
+        candidate_langs = [l for l in expanded_prefs if l in tracks_by_lang]
         if not candidate_langs:
-            candidate_langs = list(tracks_by_lang.keys())[:2]
+            orig_langs = [k for k in tracks_by_lang.keys() if k.endswith("-orig")]
+            candidate_langs = orig_langs[:2] if orig_langs else list(tracks_by_lang.keys())[:2]
         for lang in candidate_langs:
             formats = tracks_by_lang.get(lang) or []
-            json3_fmt = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+            # Prefer untranslated json3 URLs (without tlang=)
+            json3_candidates = [f for f in formats if f.get("ext") == "json3" and f.get("url")]
+            json3_fmt = next((f for f in json3_candidates if "tlang=" not in str(f.get("url", ""))), None)
+            if not json3_fmt and json3_candidates:
+                json3_fmt = json3_candidates[-1]
             if json3_fmt:
+                raw_url = json3_fmt["url"]
                 try:
-                    resp = requests.get(json3_fmt["url"], timeout=20)
+                    resp = requests.get(raw_url, timeout=15)
                     if resp.status_code == 200:
                         segs = parse_json3_captions(resp.json())
                         if segs:
                             return segs, f"tier2_ytdlp_{source_key}_{lang}"
+                    elif resp.status_code == 429:
+                        relay_resp = requests.get(
+                            f"https://r.jina.ai/{raw_url}",
+                            headers={"User-Agent": "Mozilla/5.0", "X-Return-Format": "text"},
+                            timeout=25,
+                        )
+                        if relay_resp.status_code == 200 and '"events"' in relay_resp.text:
+                            segs = parse_json3_captions(relay_resp.json())
+                            if segs:
+                                return segs, f"tier2b_ytdlp_jina_relay_{source_key}_{lang}"
                 except Exception:
                     pass
     return None, "tier2_no_captions_found"
@@ -765,8 +805,10 @@ def process_video(
     segments, method_note = load_cached_transcript_from_disk(raw_dir, vid)
     if not segments:
         segments, method_note = fetch_transcript_tier1(vid, lang_prefs)
-        if not segments and info and "429" not in method_note:
-            segments, method_note = fetch_transcript_tier2_ytdlp(info, lang_prefs)
+        if not segments and info:
+            segments, tier2_note = fetch_transcript_tier2_ytdlp(info, lang_prefs)
+            if segments:
+                method_note = tier2_note
         if not segments:
             segments, asr_note = fetch_transcript_tier3_whisper_asr(vid, raw_dir)
             if segments:
@@ -775,14 +817,19 @@ def process_video(
             save_cached_transcript_to_disk(raw_dir, vid, segments)
 
     word_count = sum(len(str(s.get("text", "")).split()) for s in (segments or []))
-    evidence_level = "FULL_TRANSCRIPT_VERIFIED" if segments and word_count > 50 else "METADATA_ONLY_NO_SUBS"
+    has_full_transcript = bool(segments and word_count > 50)
+    evidence_level = "FULL_TRANSCRIPT_VERIFIED" if has_full_transcript else "METADATA_ONLY_NO_SUBS"
 
     cues = detect_visual_cues(segments or [], chapters=chapters, duration=duration, max_cues=15)
     saved_keyframes: List[str] = []
     if extract_frames and info and cues:
         saved_keyframes = extract_keyframes_ffmpeg(vid, info, cues, keyframes_dir, max_keyframes=max_keyframes)
         if saved_keyframes:
-            evidence_level = "FULL_TRANSCRIPT_PLUS_KEYFRAMES"
+            evidence_level = (
+                "FULL_TRANSCRIPT_PLUS_KEYFRAMES"
+                if has_full_transcript
+                else "METADATA_PLUS_KEYFRAMES_NO_SUBS"
+            )
 
     sections = group_segments_into_sections(segments or [], chapters, duration)
 

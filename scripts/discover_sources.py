@@ -92,17 +92,62 @@ def search_youtube_bucket(queries: List[str], max_per_query: int = 8, min_durati
     return candidates
 
 
-def search_github_bucket(queries: List[str], max_repos: int = 8, max_issues: int = 6) -> List[Dict[str, Any]]:
-    """Search GitHub Repositories and Issues/Discussions for official codebases, clones, and real bug reports."""
+NOISE_QUERY_WORDS = {
+    "usage", "and", "best", "use", "cases", "case", "how", "to", "tutorial", "tutorials",
+    "guide", "guides", "workflow", "workflows", "architecture", "deep", "dive", "setup",
+    "full", "complete", "review", "comparison", "vs", "or", "for", "with", "in", "on",
+    "cach", "su", "dung", "huong", "dan", "chi", "tiet", "toan", "dien", "la", "gi",
+    "cách", "sử", "dụng", "hướng", "dẫn", "chi", "tiết", "toàn", "diện", "là", "gì",
+}
+
+
+def extract_core_entities(topic: str, extra_queries: Optional[List[str]] = None) -> List[str]:
+    """
+    Extracts clean tool/product entity names (e.g., ['Grok Bot', 'OpenBot']) from conversational
+    or multilingual topic strings like 'Grok Bot / OpenBot usage and best use cases'.
+    """
+    raw_inputs = [topic] + list(extra_queries or [])
+    entities: List[str] = []
+    for raw in raw_inputs:
+        # Split on slashes, ampersands, commas, 'vs', 'and'
+        parts = re.split(r"\s*(?:/|&|,|\bvs\.?\b|\band\b|\bvà\b|\bhoặc\b)\s*", raw, flags=re.I)
+        for p in parts:
+            tokens = [
+                w for w in re.findall(r"[A-Za-z0-9_.-]+", p)
+                if w.lower() not in NOISE_QUERY_WORDS and len(w) >= 2
+            ]
+            if tokens:
+                ent = " ".join(tokens[:3]).strip()
+                if ent and ent.lower() not in {e.lower() for e in entities}:
+                    entities.append(ent)
+    if not entities:
+        entities = [topic.strip()[:40]]
+    return entities[:4]
+
+
+def _matches_any_entity(text: str, entities: List[str]) -> bool:
+    low = text.lower()
+    low_compact = re.sub(r"[\s_-]+", "", low)
+    for ent in entities:
+        ent_low = ent.lower().strip()
+        ent_compact = re.sub(r"[\s_-]+", "", ent_low)
+        if ent_low in low or (len(ent_compact) >= 5 and ent_compact in low_compact):
+            return True
+    return False
+
+
+def search_github_bucket(entities: List[str], max_repos: int = 8, max_issues: int = 6) -> List[Dict[str, Any]]:
+    """Search GitHub Repositories and Issues/Discussions using clean entity names and strict title/repo relevance filtering."""
     headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github.v3+json"}
     seen_urls = set()
     candidates: List[Dict[str, Any]] = []
 
-    for q in queries[:3]:
-        # 1. Repositories search
+    for ent in entities[:3]:
+        # 1. Repositories search (exact entity phrase)
         try:
+            repo_q = f'"{ent}"' if " " in ent else ent
             r = requests.get(
-                f"https://api.github.com/search/repositories?q={quote_plus(q)}&sort=stars&order=desc&per_page={max_repos}",
+                f"https://api.github.com/search/repositories?q={quote_plus(repo_q)}&sort=stars&order=desc&per_page={max_repos}",
                 headers=headers,
                 timeout=12,
             )
@@ -111,10 +156,12 @@ def search_github_bucket(queries: List[str], max_repos: int = 8, max_issues: int
                     html_url = item.get("html_url")
                     if not html_url or html_url in seen_urls:
                         continue
-                    seen_urls.add(html_url)
-                    stars = int(item.get("stargazers_count") or 0)
                     full_name = item.get("full_name") or ""
                     desc = item.get("description") or ""
+                    if not _matches_any_entity(f"{full_name} {desc}", entities):
+                        continue
+                    seen_urls.add(html_url)
+                    stars = int(item.get("stargazers_count") or 0)
                     candidates.append(
                         {
                             "bucket": "Bucket 1: Official Docs & GitHub Repositories",
@@ -123,16 +170,16 @@ def search_github_bucket(queries: List[str], max_repos: int = 8, max_issues: int
                             "title": f"GitHub Repo: {full_name} ({stars:,} stars) — {desc[:100]}",
                             "author": (item.get("owner") or {}).get("login") or "github",
                             "stars": stars,
-                            "query_matched": q,
-                            "quality_score": 40 + min(40, int((stars ** 0.3) if stars > 0 else 5)),
+                            "query_matched": ent,
+                            "quality_score": 45 + min(40, int((stars ** 0.3) if stars > 0 else 5)),
                         }
                     )
         except Exception:
             pass
 
-        # 2. GitHub Issues / Pitfalls search
+        # 2. GitHub Issues / Pitfalls search — require entity in:title so unrelated repos with huge comment bodies never pollute
         try:
-            issue_q = f"{q} (bug OR limit OR error OR architecture OR workaround)"
+            issue_q = f'"{ent}" in:title (bug OR limit OR error OR architecture OR workflow OR agent)'
             r_iss = requests.get(
                 f"https://api.github.com/search/issues?q={quote_plus(issue_q)}&sort=comments&order=desc&per_page={max_issues}",
                 headers=headers,
@@ -142,10 +189,12 @@ def search_github_bucket(queries: List[str], max_repos: int = 8, max_issues: int
                 for item in (r_iss.json().get("items") or [])[:max_issues]:
                     html_url = item.get("html_url")
                     comments = int(item.get("comments") or 0)
-                    if not html_url or html_url in seen_urls or comments < 2:
+                    title = item.get("title") or ""
+                    if not html_url or html_url in seen_urls or comments < 1:
+                        continue
+                    if not _matches_any_entity(f"{title} {html_url}", entities):
                         continue
                     seen_urls.add(html_url)
-                    title = item.get("title") or ""
                     candidates.append(
                         {
                             "bucket": "Bucket 4: Community Failure Modes & Issues",
@@ -275,20 +324,23 @@ def search_reddit_bucket(queries: List[str], max_per_query: int = 8) -> List[Dic
 
 def build_query_variants(topic: str, extra_queries: Optional[List[str]] = None) -> Dict[str, List[str]]:
     """Generate targeted multi-angle search queries for each of the 4 research buckets."""
-    base = topic.strip()
+    entities = extract_core_entities(topic, extra_queries)
     extras = [q.strip() for q in (extra_queries or []) if q.strip()]
 
-    yt_queries = extras + [
-        f"{base} full tutorial workflow",
-        f"{base} use cases setup guide",
-        f"{base} architecture deep dive",
-    ]
-    gh_queries = extras[:2] + [base]
-    hn_queries = extras[:2] + [base]
-    reddit_queries = extras[:2] + [
-        f"{base} workflow OR review OR bug",
-        f"{base} vs alternative",
-    ]
+    yt_queries: List[str] = []
+    for ent in entities[:3]:
+        yt_queries.extend(
+            [
+                f"{ent} full tutorial workflow",
+                f"{ent} use cases setup guide",
+                f"{ent} architecture deep dive",
+            ]
+        )
+    yt_queries.extend(extras)
+
+    gh_queries = entities
+    hn_queries = entities
+    reddit_queries = [f"{ent} workflow OR review OR bug" for ent in entities[:2]] + entities
     return {
         "youtube": list(dict.fromkeys(yt_queries)),
         "github": list(dict.fromkeys(gh_queries)),
@@ -404,6 +456,7 @@ def main() -> None:
                 "--keyframes",
                 "--max-keyframes",
                 "3",
+                "--auto-snowball",
                 "--workers",
                 "3",
             ]

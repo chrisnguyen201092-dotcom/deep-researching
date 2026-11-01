@@ -42,8 +42,12 @@ FORBIDDEN_SLOP_PATTERNS = [
         "Word-padding meta-commentary ('as transcripts become available') — delete filler sentence.",
     ),
     (
-        r"\bas new sources are (?:ingested|added to the corpus)\b",
-        "Word-padding meta-commentary ('as new sources are added to the corpus') — delete filler sentence.",
+        r"\bas new sources are (?:ingested|added to the corpus)\b|\bas the evidence base grows\b",
+        "Word-padding meta-commentary ('as new sources are added / evidence base grows') — delete filler sentence.",
+    ),
+    (
+        r"\bstored under `?01_raw_sources/keyframes\b",
+        "Lazy pointer to keyframes directory ('stored under 01_raw_sources/keyframes') — embed the image inline with ![caption](path) instead.",
     ),
 ]
 
@@ -171,8 +175,17 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
     verified_sources = [
         s
         for s in sources
-        if str(s.get("evidence_level", "")).startswith("FULL_")
+        if str(s.get("evidence_level", "")).startswith("FULL_") and int(s.get("word_count") or 0) >= 80
     ]
+    zero_word_yt = [
+        s.get("id")
+        for s in sources
+        if s.get("kind") == "youtube" and int(s.get("word_count") or 0) < 50
+    ]
+    if zero_word_yt:
+        warnings.append(
+            f"{len(zero_word_yt)} YouTube video(s) had 0 transcript words ({', '.join(zero_word_yt[:5])}) and were excluded from verified_full_sources."
+        )
 
     if len(verified_sources) < min_sources:
         errors.append(
@@ -243,6 +256,13 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
             errors.append(
                 f"Playbook '{pb.name}' lacks concrete code/prompt/config blocks (no fenced ``` block found)."
             )
+        else:
+            pb_blocks = re.findall(r"```(?!mermaid)\w*\n(.*?)```", pb_txt, flags=re.DOTALL)
+            multiline_pb_blocks = [b for b in pb_blocks if len([ln for ln in b.strip().splitlines() if ln.strip()]) >= 3]
+            if not multiline_pb_blocks:
+                errors.append(
+                    f"Playbook '{pb.name}' only contains 1-line stub code blocks. Include at least one multi-line (>= 3 lines) verbatim System Prompt, Skill definition, or config block."
+                )
         slop_hits.extend(scan_file_for_slop(pb))
 
     # Check Master Report (Structural & Artifact Density over Word Count)
@@ -264,11 +284,12 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
         if "```mermaid" not in m_txt or "|" not in m_txt:
             errors.append("00_MASTER_REPORT.md must include both a Mermaid architecture diagram (```mermaid) and comparison tables (|).")
 
-        # Self-contained prompt/config block check (excluding mermaid blocks)
-        non_mermaid_fences = len(re.findall(r"^```(?!mermaid)\w+", m_txt, flags=re.MULTILINE))
-        if non_mermaid_fences < 3:
+        # Self-contained multi-line prompt/config block check (excluding mermaid blocks)
+        code_blocks = re.findall(r"```(?!mermaid)\w*\n(.*?)```", m_txt, flags=re.DOTALL)
+        multiline_blocks = [b for b in code_blocks if len([ln for ln in b.strip().splitlines() if ln.strip()]) >= 4]
+        if len(code_blocks) < 3 or len(multiline_blocks) < 2:
             errors.append(
-                f"00_MASTER_REPORT.md has only {non_mermaid_fences} inline code/prompt/config block(s) (expected >= 3 so the Master Report is self-contained)."
+                f"00_MASTER_REPORT.md has {len(code_blocks)} code/prompt block(s) ({len(multiline_blocks)} multi-line >= 4 lines); expected >= 3 blocks with at least 2 substantive multi-line System Prompts/Configs (never use 1-line fake CLI commands)."
             )
 
         # Callout block check for visual readability
@@ -286,9 +307,14 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
                     f"01_raw_sources/keyframes/ has {len(available_keyframes)} images, but 00_MASTER_REPORT.md embeds only {inline_imgs} inline image(s) (![caption](...)). Embed >= 2 keyframe visuals inline."
                 )
 
-        # Check that narrative prose before the final audit table isn't cluttered with raw _note.md filenames
+        # Check narrative prose for inline citations AND absence of raw _note.md filename clutter
         body_parts = re.split(r"^##\s+[6789]\.", m_txt, maxsplit=1, flags=re.MULTILINE)
         narrative_body = body_parts[0] if body_parts else m_txt
+        inline_citations = re.findall(r"\[#\d+[^\]]*\]|\[\d{1,2}:\d{2}(?::\d{2})?\]", narrative_body)
+        if len(inline_citations) < 5:
+            errors.append(
+                f"Uncited narrative prose: 00_MASTER_REPORT.md contains only {len(inline_citations)} inline citation(s) ([#1], [#2, 14:20], or [MM:SS]) in narrative sections. Every technical claim must cite its source."
+            )
         raw_note_mentions_in_prose = len(re.findall(r"_note\.md", narrative_body))
         if raw_note_mentions_in_prose > 5:
             errors.append(

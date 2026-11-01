@@ -322,8 +322,103 @@ def search_reddit_bucket(queries: List[str], max_per_query: int = 8) -> List[Dic
     return candidates
 
 
+def search_scholar_bucket(entities: List[str], max_per_query: int = 6) -> List[Dict[str, Any]]:
+    """
+    Scholarly & Canonical Paper Discovery (OpenAlex + arXiv APIs, inspired by Hyperresearch `scholar/`):
+    - Queries OpenAlex (`api.openalex.org/works`) sorted by citation count, automatically skipping retracted papers (`is_retracted`).
+    - Queries arXiv (`export.arxiv.org/api/query`) for cutting-edge CS/AI/Math preprints.
+    - Deduplicates by DOI / normalized title and prefers Open-Access PDF or landing URLs.
+    """
+    seen_keys = set()
+    candidates: List[Dict[str, Any]] = []
+    headers = {"User-Agent": f"{USER_AGENT} (mailto:research@openbot.ai)"}
+
+    for ent in entities[:2]:
+        # 1. OpenAlex API (citation-ranked works, retraction-filtered)
+        try:
+            oa_url = (
+                f"https://api.openalex.org/works?search={quote_plus(ent)}"
+                f"&filter=is_retracted:false&sort=cited_by_count:desc&per_page={max_per_query}"
+            )
+            r = requests.get(oa_url, headers=headers, timeout=12)
+            if r.status_code == 200:
+                for item in (r.json().get("results") or []):
+                    if item.get("is_retracted"):
+                        continue
+                    title = (item.get("title") or "").strip()
+                    if not title or not _matches_any_entity(title, entities):
+                        continue
+                    doi = item.get("doi") or ""
+                    oa_loc = (
+                        (item.get("best_oa_location") or {}).get("url_for_pdf")
+                        or (item.get("open_access") or {}).get("oa_url")
+                        or doi
+                        or item.get("id")
+                    )
+                    if not oa_loc:
+                        continue
+                    norm_key = (doi or re.sub(r"\W+", "", title.lower()))[:60]
+                    if norm_key in seen_keys:
+                        continue
+                    seen_keys.add(norm_key)
+                    cites = int(item.get("cited_by_count") or 0)
+                    year = item.get("publication_year") or ""
+                    candidates.append(
+                        {
+                            "bucket": "Bucket 3: Expert Deep-Dives & Scholarly Papers",
+                            "type": "web",
+                            "url": oa_loc,
+                            "title": f"[Paper {year}, {cites:,} cites] {title}",
+                            "author": "OpenAlex",
+                            "citations": cites,
+                            "doi": doi,
+                            "query_matched": ent,
+                            "quality_score": 30 + min(40, int((cites ** 0.35) if cites > 0 else 8)),
+                        }
+                    )
+        except Exception:
+            pass
+
+        # 2. arXiv API (for AI/CS/Engineering technical papers)
+        try:
+            arxiv_q = f'ti:"{ent}"' if " " in ent else f"ti:{ent}"
+            ax_url = f"http://export.arxiv.org/api/query?search_query={quote_plus(arxiv_q)}&sortBy=relevance&max_results={max_per_query}"
+            r_ax = requests.get(ax_url, headers=headers, timeout=12)
+            if r_ax.status_code == 200:
+                entries = re.findall(r"<entry>([\s\S]*?)</entry>", r_ax.text)
+                for entry_xml in entries:
+                    id_m = re.search(r"<id>(https?://arxiv\.org/abs/[^\s<]+)</id>", entry_xml)
+                    t_m = re.search(r"<title>([\s\S]*?)</title>", entry_xml)
+                    if not id_m or not t_m:
+                        continue
+                    abs_url = id_m.group(1).strip()
+                    title = re.sub(r"\s+", " ", t_m.group(1)).strip()
+                    if not _matches_any_entity(title, entities):
+                        continue
+                    norm_key = re.sub(r"\W+", "", title.lower())[:60]
+                    if norm_key in seen_keys:
+                        continue
+                    seen_keys.add(norm_key)
+                    candidates.append(
+                        {
+                            "bucket": "Bucket 3: Expert Deep-Dives & Scholarly Papers",
+                            "type": "web",
+                            "url": abs_url,
+                            "title": f"[arXiv Preprint] {title}",
+                            "author": "arXiv",
+                            "query_matched": ent,
+                            "quality_score": 38,
+                        }
+                    )
+        except Exception:
+            pass
+
+    candidates.sort(key=lambda x: x.get("quality_score", 0), reverse=True)
+    return candidates
+
+
 def build_query_variants(topic: str, extra_queries: Optional[List[str]] = None) -> Dict[str, List[str]]:
-    """Generate targeted multi-angle search queries for each of the 4 research buckets."""
+    """Generate targeted multi-angle search queries for each of the research buckets."""
     entities = extract_core_entities(topic, extra_queries)
     extras = [q.strip() for q in (extra_queries or []) if q.strip()]
 
@@ -346,16 +441,17 @@ def build_query_variants(topic: str, extra_queries: Optional[List[str]] = None) 
         "github": list(dict.fromkeys(gh_queries)),
         "hn": list(dict.fromkeys(hn_queries)),
         "reddit": list(dict.fromkeys(reddit_queries)),
+        "scholar": list(dict.fromkeys(entities)),
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Multi-Bucket Autonomous Source Discovery Engine v3.0")
+    parser = argparse.ArgumentParser(description="Multi-Bucket Autonomous Source Discovery Engine v3.3")
     parser.add_argument("topic", help="Primary research topic or keyword")
     parser.add_argument("--queries", nargs="*", default=[], help="Optional additional search query variants")
     parser.add_argument("--out", required=True, help="Research workspace directory")
     parser.add_argument("--max-yt", type=int, default=15, help="Max YouTube candidates to retain")
-    parser.add_argument("--max-web", type=int, default=20, help="Max Web/GitHub/Community candidates to retain")
+    parser.add_argument("--max-web", type=int, default=20, help="Max Web/GitHub/Community/Scholar candidates to retain")
     parser.add_argument("--auto-ingest", action="store_true", help="Automatically ingest top discovered sources")
     parser.add_argument("--ingest-yt-count", type=int, default=8, help="Number of top YouTube videos to auto-ingest")
     parser.add_argument("--ingest-web-count", type=int, default=8, help="Number of top Web/GitHub URLs to auto-ingest")
@@ -366,21 +462,23 @@ def main() -> None:
 
     q_map = build_query_variants(args.topic, args.queries)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         f_yt = pool.submit(search_youtube_bucket, q_map["youtube"])
         f_gh = pool.submit(search_github_bucket, q_map["github"])
         f_hn = pool.submit(search_hackernews_bucket, q_map["hn"])
         f_rd = pool.submit(search_reddit_bucket, q_map["reddit"])
+        f_sc = pool.submit(search_scholar_bucket, q_map["scholar"])
 
         yt_results = f_yt.result()[: args.max_yt]
         gh_results = f_gh.result()
         hn_results = f_hn.result()
         rd_results = f_rd.result()
+        sc_results = f_sc.result()
 
-    # Combine and deduplicate web candidates across Buckets 1, 3, 4
+    # Combine and deduplicate web candidates across Buckets 1, 3, 4 (including Scholarly papers)
     seen_web = set()
     web_results: List[Dict[str, Any]] = []
-    for item in gh_results + hn_results + rd_results:
+    for item in gh_results + hn_results + rd_results + sc_results:
         u = item["url"]
         if u not in seen_web:
             seen_web.add(u)

@@ -310,7 +310,10 @@ def audit_workspace(ws: Path, min_sources: int, min_playbooks: int) -> Dict[str,
         # Check narrative prose for inline citations AND absence of raw _note.md filename clutter
         body_parts = re.split(r"^##\s+[6789]\.", m_txt, maxsplit=1, flags=re.MULTILINE)
         narrative_body = body_parts[0] if body_parts else m_txt
-        inline_citations = re.findall(r"\[#\d+[^\]]*\]|\[\d{1,2}:\d{2}(?::\d{2})?\]", narrative_body)
+        inline_citations = re.findall(
+            r"\[(?:#\d+|(?:yt|web|gh|rd)_[A-Za-z0-9_-]+)[^\]]*\]|\[\d{1,2}:\d{2}(?::\d{2})?\]",
+            narrative_body,
+        )
         if len(inline_citations) < 5:
             errors.append(
                 f"Uncited narrative prose: 00_MASTER_REPORT.md contains only {len(inline_citations)} inline citation(s) ([#1], [#2, 14:20], or [MM:SS]) in narrative sections. Every technical claim must cite its source."
